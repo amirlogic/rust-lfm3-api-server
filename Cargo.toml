@@ -1,0 +1,43 @@
+[package]
+name = "lfm3-server"
+version = "0.1.0"
+edition = "2021"
+description = "OpenAI-compatible API server for the LFM3-1.7B model using ONNX Runtime"
+
+[[bin]]
+name = "lfm3-server"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Web framework
+axum = { version = "0.7", features = ["json"] }
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# ONNX Runtime bindings
+ort = { version = "2.0.0-rc.15", features = ["load-dynamic"] }
+
+# Tokenizer (HuggingFace tokenizers)
+tokenizers = "0.21"
+
+# ndarray for tensor manipulation
+ndarray = "0.17"
+
+# CLI argument parsing
+clap = { version = "4", features = ["derive", "env"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+anyhow = "1"
+
+# Misc
+rand = "0.8"
