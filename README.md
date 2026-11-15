@@ -59,11 +59,27 @@ cargo build
   - Linux / macOS: `target/debug/lfm3-server`
 
 > [!NOTE]
-> `ort` uses the **load-dynamic** feature, which automatically downloads or resolves the official ONNX Runtime shared library (`onnxruntime.dll` on Windows, `libonnxruntime.so` on Linux, `libonnxruntime.dylib` on macOS).
-> If deploying the standalone executable to another machine, place `onnxruntime.dll` in the same directory as the executable, or set the `ORT_DYLIB_PATH` environment variable:
+> `ort` uses **load-dynamic** and does not bundle or download the ONNX Runtime shared library. Download the official ONNX Runtime package for your platform and architecture from the [ONNX Runtime releases](https://github.com/microsoft/onnxruntime/releases). The library must be compatible with ONNX Runtime API 31 (ONNX Runtime 1.31 or newer).
+> On Windows, set `ORT_DYLIB_PATH` to the full path of `onnxruntime.dll` from the extracted package (typically under `lib`), or place that DLL next to the executable. On Linux and macOS, set it to the corresponding `libonnxruntime.so` or `libonnxruntime.dylib` file.
+>
+> **Windows (CPU, no CUDA required):** Download the `onnxruntime-win-x64-<version>.zip` package. Do not choose a package with `-gpu-` in its name unless you specifically need GPU support. Extract the ZIP, then set `ORT_DYLIB_PATH` to the extracted `onnxruntime.dll`. For example, if the ZIP is in Downloads:
+>
 > ```powershell
-> $env:ORT_DYLIB_PATH = "C:\path\to\onnxruntime.dll"
+> Expand-Archive "$HOME\Downloads\onnxruntime-win-x64-1.31.1.zip" `
+>   -DestinationPath "$HOME\onnxruntime" -Force
+>
+> $dll = Get-ChildItem "$HOME\onnxruntime" -Recurse -Filter onnxruntime.dll |
+>   Select-Object -First 1 -ExpandProperty FullName
+> $env:ORT_DYLIB_PATH = $dll
 > ```
+>
+> Keep this PowerShell window open and launch the server from it so the environment variable is available:
+>
+> ```powershell
+> .\target\release\lfm3-server.exe --model-dir .\model
+> ```
+>
+> Change the ZIP filename to match the version you downloaded. Ensure the DLL is the official ONNX Runtime library and exports `OrtGetApiBase`; unrelated DLLs with the same filename will fail to load.
 
 ---
 

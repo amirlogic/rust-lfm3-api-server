@@ -179,7 +179,9 @@ async fn chat_completions(
             .into_response()
         }
         Ok(Err(e)) => {
-            error!(error = %e, "Inference failed");
+            // Include anyhow's source chain so ONNX Runtime input/shape/type
+            // errors are visible in the server log instead of only the outer context.
+            error!(error = %format!("{e:#}"), "Inference failed");
             api_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())
         }
         Err(e) => {

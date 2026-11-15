@@ -5,7 +5,7 @@
 //! LFM3 is a tri-hybrid model (gated short-conv + sliding-window attention + global attention).
 //! The ONNX export from `onnx-community/LFM3-1.7B-ONNX` bundles both the KV-attention caches
 //! (`past_key_values.N.key` / `past_key_values.N.value`) and the convolution states
-//! (`past_conv_states.N`) as dynamic inputs / outputs so the generation loop can be run
+//! (`past_conv.N` or `past_conv_states.N`) as dynamic inputs / outputs so the generation loop can be run
 //! entirely inside ORT without touching Python.
 //!
 //! The number of cache layers is discovered dynamically by inspecting the session's input metadata
@@ -15,8 +15,8 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context};
-use ndarray::{Array2, ArrayD, Axis, IxDyn};
-use ort::{session::Session, value::Tensor};
+use ndarray::{Array0, Array2, ArrayD, Axis, IxDyn};
+use ort::{session::Session, value::{Tensor, TensorElementType, ValueType}};
 use tokenizers::Tokenizer;
 use tracing::{debug, info, instrument};
 
@@ -67,8 +67,8 @@ impl Engine {
         // --- Discover cache tensor layout --------------------------------
         let cache_layout = discover_cache_layout(&session)?;
         info!(
-            kv_layers = cache_layout.num_kv_layers,
-            conv_layers = cache_layout.num_conv_layers,
+            kv_layers = cache_layout.kv_layer_indices.len(),
+            conv_layers = cache_layout.conv_layer_indices.len(),
             has_position_ids = cache_layout.has_position_ids,
             "Cache layout discovered"
         );
@@ -108,8 +108,10 @@ pub struct GenerateResult {
 
 #[derive(Debug, Clone)]
 struct CacheLayout {
-    num_kv_layers: usize,
-    num_conv_layers: usize,
+    kv_layer_indices: Vec<usize>,
+    conv_layer_indices: Vec<usize>,
+    conv_input_prefix: String,
+    conv_output_prefix: String,
     /// True when the model expects `position_ids` as an explicit input.
     has_position_ids: bool,
 }
@@ -121,21 +123,48 @@ fn discover_cache_layout(session: &Session) -> anyhow::Result<CacheLayout> {
         .map(|outlet| outlet.name().to_string())
         .collect();
 
-    let num_kv_layers = input_names
+    let mut kv_layer_indices: Vec<usize> = input_names
         .iter()
-        .filter(|n: &&String| n.starts_with("past_key_values.") && n.ends_with(".key"))
-        .count();
+        .filter_map(|name| {
+            name.strip_prefix("past_key_values.")
+                .and_then(|tail| tail.strip_suffix(".key"))
+                .and_then(|index| index.parse::<usize>().ok())
+        })
+        .collect();
+    kv_layer_indices.sort_unstable();
 
-    let num_conv_layers = input_names
+    let conv_input_prefix = if input_names.iter().any(|n| n.starts_with("past_conv.")) {
+        "past_conv."
+    } else {
+        "past_conv_states."
+    };
+    let mut conv_layer_indices: Vec<usize> = input_names
         .iter()
-        .filter(|n: &&String| n.starts_with("past_conv_states."))
-        .count();
+        .filter_map(|name| {
+            name.strip_prefix(conv_input_prefix)
+                .and_then(|index| index.parse::<usize>().ok())
+        })
+        .collect();
+    conv_layer_indices.sort_unstable();
+
+    let conv_output_names: Vec<String> = session
+        .outputs()
+        .iter()
+        .map(|outlet| outlet.name().to_string())
+        .collect();
+    let conv_output_prefix = if conv_output_names.iter().any(|n| n.starts_with("present_conv.")) {
+        "present_conv."
+    } else {
+        "present_conv_states."
+    };
 
     let has_position_ids = input_names.iter().any(|n: &String| n == "position_ids");
 
     Ok(CacheLayout {
-        num_kv_layers,
-        num_conv_layers,
+        kv_layer_indices,
+        conv_layer_indices,
+        conv_input_prefix: conv_input_prefix.to_string(),
+        conv_output_prefix: conv_output_prefix.to_string(),
         has_position_ids,
     })
 }
@@ -222,9 +251,22 @@ impl EngineInner {
                 ]
             };
 
+            // This export uses num_logits_to_keep to trim the LM head output.
+            // Ask for just the final prompt/token position, which is the only
+            // position consumed by the greedy decoding loop below.
+            for name in ["num_logits_to_keep", "logits_to_keep"] {
+                if self.session.inputs().iter().any(|outlet| outlet.name() == name) {
+                    let keep_last_logit = Array0::from_elem((), 1i64);
+                    inputs.push((
+                        name.into(),
+                        Tensor::from_array(keep_last_logit)?.into(),
+                    ));
+                }
+            }
+
             // ── Cache tensors ───────────────────────────────────────────────
             if let Some(ref cache) = kv_cache {
-                for (layer_idx, (k, v)) in cache.kv.iter().enumerate() {
+                for (layer_idx, k, v) in &cache.kv {
                     inputs.push((
                         format!("past_key_values.{layer_idx}.key").into(),
                         Tensor::from_array(k.clone())?.into(),
@@ -234,29 +276,27 @@ impl EngineInner {
                         Tensor::from_array(v.clone())?.into(),
                     ));
                 }
-                for (layer_idx, s) in cache.conv.iter().enumerate() {
+                for (layer_idx, s) in &cache.conv {
                     inputs.push((
-                        format!("past_conv_states.{layer_idx}").into(),
+                        format!("{}{layer_idx}", self.cache_layout.conv_input_prefix).into(),
                         Tensor::from_array(s.clone())?.into(),
                     ));
                 }
             } else {
                 // Step 0 — provide empty zero-element caches for each expected input
-                let all_input_names: Vec<String> = self
-                    .session
-                    .inputs()
-                    .iter()
-                    .map(|o| o.name().to_string())
-                    .collect();
-
-                for name in &all_input_names {
-                    if (name.starts_with("past_key_values.") || name.starts_with("past_conv_states."))
-                        && !inputs.iter().any(|(n, _)| n.as_ref() == name.as_str())
+                for outlet in self.session.inputs() {
+                    let name = outlet.name();
+                    if (name.starts_with("past_key_values.")
+                        || name.starts_with("past_conv_states.")
+                        || name.starts_with("past_conv."))
+                        && !inputs.iter().any(|(n, _)| n.as_ref() == name)
                     {
-                        // Empty 4-D tensor [1, 1, 0, 1] — ORT treats the 0-length dim as "no cache yet"
-                        let empty: ArrayD<f32> = ArrayD::zeros(IxDyn(&[1, 1, 0, 1]));
+                        // Preserve this cache input's declared head/channel dimensions and
+                        // set dynamic dimensions to zero (except a dynamic batch dimension).
+                        let empty = empty_cache_tensor(outlet)
+                            .with_context(|| format!("Failed to initialize cache input '{name}'"))?;
                         inputs.push((
-                            name.clone().into(),
+                            name.to_string().into(),
                             Tensor::from_array(empty)?.into(),
                         ));
                     }
@@ -319,39 +359,94 @@ impl EngineInner {
     }
 }
 
+fn empty_cache_tensor(outlet: &ort::value::Outlet) -> anyhow::Result<ArrayD<f32>> {
+    let shape = match outlet.dtype() {
+        ValueType::Tensor { ty: TensorElementType::Float32, shape, .. } => shape,
+        other => bail!("Cache input '{}' must be an f32 tensor, got {other:?}", outlet.name()),
+    };
+
+    if shape.is_empty() {
+        bail!("Cache input '{}' has no tensor dimensions", outlet.name());
+    }
+
+    let dims: Vec<usize> = shape
+        .iter()
+        .enumerate()
+        .map(|(axis, &dim)| {
+            if dim >= 0 {
+                dim as usize
+            } else if axis == 0 {
+                // This server runs one sequence per request.
+                1
+            } else {
+                // Empty past sequence/state; the model fills it on the first step.
+                0
+            }
+        })
+        .collect();
+
+    Ok(ArrayD::zeros(IxDyn(&dims)))
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // KV cache helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
 struct KvCache {
-    kv: Vec<(ArrayD<f32>, ArrayD<f32>)>,
-    conv: Vec<ArrayD<f32>>,
+    kv: Vec<(usize, ArrayD<f32>, ArrayD<f32>)>,
+    conv: Vec<(usize, ArrayD<f32>)>,
 }
 
 fn extract_kv_cache(
     outputs: &ort::session::SessionOutputs<'_>,
     layout: &CacheLayout,
 ) -> anyhow::Result<KvCache> {
-    let mut kv: Vec<(ArrayD<f32>, ArrayD<f32>)> = Vec::new();
-    let mut conv: Vec<ArrayD<f32>> = Vec::new();
+    let mut kv: Vec<(usize, ArrayD<f32>, ArrayD<f32>)> = Vec::new();
+    let mut conv: Vec<(usize, ArrayD<f32>)> = Vec::new();
 
-    for i in 0..layout.num_kv_layers {
-        let key = extract_f32_array(outputs, &format!("present.{i}.key"))
-            .or_else(|_| extract_f32_array(outputs, &format!("present_key_values.{i}.key")))
-            .with_context(|| format!("Missing present key for layer {i}"))?;
-        let val = extract_f32_array(outputs, &format!("present.{i}.value"))
-            .or_else(|_| extract_f32_array(outputs, &format!("present_key_values.{i}.value")))
-            .with_context(|| format!("Missing present value for layer {i}"))?;
-        kv.push((key, val));
+    for &layer_idx in &layout.kv_layer_indices {
+        let key = extract_present_cache(outputs, layer_idx, "key")
+            .with_context(|| format!("Missing present key for layer {layer_idx}"))?;
+        let val = extract_present_cache(outputs, layer_idx, "value")
+            .with_context(|| format!("Missing present value for layer {layer_idx}"))?;
+        kv.push((layer_idx, key, val));
     }
 
-    for i in 0..layout.num_conv_layers {
-        let s = extract_f32_array(outputs, &format!("present_conv_states.{i}"))
-            .with_context(|| format!("Missing present conv state for layer {i}"))?;
-        conv.push(s);
+    for &layer_idx in &layout.conv_layer_indices {
+        let s = extract_f32_array(
+            outputs,
+            &format!("{}{layer_idx}", layout.conv_output_prefix),
+        )
+        .with_context(|| format!("Missing present conv state for layer {layer_idx}"))?;
+        conv.push((layer_idx, s));
     }
 
     Ok(KvCache { kv, conv })
+}
+
+fn extract_present_cache(
+    outputs: &ort::session::SessionOutputs<'_>,
+    layer: usize,
+    component: &str,
+) -> anyhow::Result<ArrayD<f32>> {
+    let suffix = format!(".{layer}.{component}");
+    let output_name = outputs
+        .keys()
+        .find(|name| name.starts_with("present") && name.ends_with(&suffix))
+        .or_else(|| {
+            outputs
+                .keys()
+                .find(|name| name.starts_with("present") && name.contains(&suffix))
+        });
+
+    let Some(output_name) = output_name else {
+        let available: Vec<&str> = outputs.keys().collect();
+        bail!(
+            "No present cache output matched layer {layer} {component}; available outputs: {available:?}"
+        );
+    };
+
+    extract_f32_array(outputs, output_name)
 }
 
 fn extract_f32_array(
