@@ -1,2 +1,4 @@
 /target
 /model
+*.ps1
+*.bat

@@ -24,9 +24,6 @@ use tracing::{debug, info, instrument};
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// LFM3 / LLaMA-3 EOS token ID
-const EOS_TOKEN_ID: i64 = 128_001;
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Public interface
 // ─────────────────────────────────────────────────────────────────────────────
@@ -52,6 +49,9 @@ impl Engine {
         // --- Tokenizer --------------------------------------------------
         let tokenizer = Tokenizer::from_file(&tokenizer_path)
             .map_err(|e| anyhow::anyhow!("Failed to load tokenizer from {}: {e}", tokenizer_path.display()))?;
+        let eos_token_id = tokenizer
+            .token_to_id("<|im_end|>")
+            .context("Tokenizer does not define the LFM3 end-of-message token <|im_end|>")?;
 
         // --- ONNX Runtime -----------------------------------------------
         let env = ort::init()
@@ -76,6 +76,7 @@ impl Engine {
         Ok(Self(Arc::new(Mutex::new(EngineInner {
             session,
             tokenizer,
+            eos_token_id,
             cache_layout,
             default_max_tokens,
         }))))
@@ -176,6 +177,7 @@ fn discover_cache_layout(session: &Session) -> anyhow::Result<CacheLayout> {
 struct EngineInner {
     session: Session,
     tokenizer: Tokenizer,
+    eos_token_id: u32,
     cache_layout: CacheLayout,
     default_max_tokens: usize,
 }
@@ -338,7 +340,7 @@ impl EngineInner {
             kv_cache = Some(extract_kv_cache(&outputs, &self.cache_layout)?);
 
             // Stop on EOS
-            if next_token == EOS_TOKEN_ID {
+            if next_token as u32 == self.eos_token_id {
                 debug!("EOS token reached at step {step}");
                 break;
             }
@@ -466,33 +468,29 @@ fn extract_f32_array(
 // Chat prompt builder
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Build a prompt string from a list of messages using LFM3 / LLaMA-3 chat template.
+/// Build a prompt string using the LFM3 chat template.
 fn build_chat_prompt(messages: &[crate::server::ChatMessage]) -> String {
-    let mut prompt = String::from("<|begin_of_text|>");
-    for msg in messages {
-        match msg.role.as_str() {
-            "system" => {
-                prompt.push_str(&format!(
-                    "<|start_header_id|>system<|end_header_id|>\n\n{}<|eot_id|>",
-                    msg.content.trim()
-                ));
-            }
-            "user" => {
-                prompt.push_str(&format!(
-                    "<|start_header_id|>user<|end_header_id|>\n\n{}<|eot_id|>",
-                    msg.content.trim()
-                ));
-            }
-            "assistant" => {
-                prompt.push_str(&format!(
-                    "<|start_header_id|>assistant<|end_header_id|>\n\n{}<|eot_id|>",
-                    msg.content.trim()
-                ));
-            }
-            _ => {}
-        }
+    let mut prompt = String::from("<|startoftext|>");
+    let mut remaining = messages;
+
+    // The model's template renders a leading system message before the rest.
+    if let Some((system, tail)) = messages.split_first().filter(|(msg, _)| msg.role == "system") {
+        prompt.push_str(&format!(
+            "<|im_start|>system\n{}<|im_end|>\n",
+            system.content.trim()
+        ));
+        remaining = tail;
     }
-    // Signal the model to start generating the assistant reply
-    prompt.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
+
+    for msg in remaining {
+        prompt.push_str(&format!(
+            "<|im_start|>{}\n{}<|im_end|>\n",
+            msg.role,
+            msg.content.trim()
+        ));
+    }
+
+    // Disable the model's thinking section so generation starts with the regular response.
+    prompt.push_str("<|im_start|>assistant\n<think></think>");
     prompt
 }
